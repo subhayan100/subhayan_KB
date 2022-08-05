@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Test for candidates
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t2.nano
+      - t2.micro
+      - t2.small
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+
+  DBName:
+    Description: Name of the Database
+    Type: String
+    Default: db1
+ 
+  MasterDbUserPassword: 
+    Description: Database Password 
+    Type: String
+    NoEcho: True
+    MinLength: 1
+    MaxLength: 8
+    AllowedPattern: ^[a-zA-Z0-9]*$
+  
+  Password:
+    NoEcho: True
+    Type: String
+    Description: New account password
+    MinLength: '1'
+    MaxLength: '41'
+    ConstraintDescription: the password must be between 1 and 41 characters
+
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+      
+Resources:
+  SpEc2Instance: 
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref ServerSecurityGroup 
+      UserData:                       
+        Fn::Base64: |
+          #!/bin/bash
+          sudo yum -y update
+          sudo yum -y install httpd php php-mysqlnd
+          sudo systemctl enable httpd
+          sudo systemctl start httpd
+          export AWS_ACCESS_KEY_ID=AKIAYSSCXZVWPSJEOZOT 
+          export AWS_SECRET_ACCESS_KEY=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 
+          export AWS_DEFAULT_REGION=us-west-2
+          echo "<h1>Deployed via CloudFormation</h1>" | sudo tee /var/www/html/index.html
+
+  ServerSecurityGroup: 
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: allow connections from specified CIDR ranges
+      SecurityGroupIngress:
+      - IpProtocol: tcp     
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp     
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+
+  BucketInfra:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: BucketOwnerFullControl 
+      BucketName: !Sub '${Environment}-file-sp-storage'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false    
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  BucketInfraPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref BucketInfra
+      PolicyDocument:
+        Id: InfraAbc
+        Version: 2012-10-17
+        Statement:
+          - Principal:
+              AWS: '*'
+            Effect: Allow
+            Action: '*'  
+            Resource: !Sub
+              - 'arn:aws:s3:::${bucketName}/*'
+              - bucketName: !Ref BucketInfra
+      
+  SpRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: Example API 
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: 'sp-api'
+
+  SpApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE 
+      HttpMethod: GET
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 404
+        - StatusCode: 422
+        - StatusCode: 501
+      ResourceId: !GetAtt SpRestApi.RootResourceId
+      RestApiId: !Ref SpRestApi
+
+
+  DefaultDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref DBName
+      DBInstanceClass: db.t3.micro
+      Engine: MySQL
+      DeletionProtection: true 
+      AllocatedStorage: "20"
+      MasterUsername: admin
+      MasterUserPassword: !Ref MasterDbUserPassword
+      MultiAZ: false 
+      PubliclyAccessible: true 
+      BackupRetentionPeriod: 0
+
+  User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "sp-${Environment}-user" 
+      LoginProfile:
+        Password: !Ref 'Password'
+  
+  UserPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: simple_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "ec2:*"
+              - "s3:*"
+              - "cloudwatch:*"
+            Resource: "*"
+      Users:
+        - !Ref User
+   TaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Sub
+        - 'arn:aws:iam::${a}:role/Role${r}ClusterExecution'
+        - a: !Ref 'AWS::AccountId'
+          r: !Ref ResourceTag
+      TaskRoleArn: !Sub
+        - 'arn:aws:iam::${a}:role/Role'
+        - a: !Ref 'AWS::AccountId'
+          r: !Ref ResourceTag
+      ContainerDefinitions:
+        - Name: !Sub
+            - '${e}-${r}'
+            - e: !Ref Environment
+              r: !Ref ResourceTag
+          Image: !Ref DockerImageId
+          Environment:
+            - Name: api_pass
+              Value: "ssddhfkd23!!"
+          Secrets:
+            - Name: kvk_api_certificate
+              ValueFrom: !Sub
+                - 'arn:aws:ssm:${region}:${account}:parameter/kvk_api_key'
+                - region: !Ref 'AWS::Region'
+                  account: !Ref 'AWS::AccountId'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "{{resolve:ssm:/platform-kvk-dataloader/cfn/${ResourceTag}/LogGroup}}"
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: ecs
+
+  KMSKeyforRoleKvkDataloader:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      Description: Key used from specific role
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: KEY-POLICY
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal: * 
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+              - kms:TagResource
+            Resource: "*"
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::GetAtt:
+                  - RoleClusterExecution
+                  - Arn
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::GetAtt:
+                  - RoleKvkDataloader
+                  - Arn
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: "*"
+            
+  PolicyRoleKvkDataloaderClusterExecution:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ecr:BatchCheckLayerAvailability'
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:BatchGetImage'
+            Resource:
+              - !Sub
+                - 'arn:aws:ecr:${region}:${account}:repository/*'
+                - region: !Ref 'AWS::Region'
+                  account: !Ref ECRAccountId
+          - Effect: Allow
+            Action: *
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource:
+              - !Sub
+                - 'arn:aws:logs:${region}:${account}:log-group:Role${r}:*'
+                - region: !Ref 'AWS::Region'
+                  account: !Ref 'AWS::AccountId'
+                  r: !Ref ResourceTag
+
+          - Effect: Allow
+            Action:
+              - 'ssm:GetParameters'
+              - 'ssm:GetParameter'
+            Resource: *
